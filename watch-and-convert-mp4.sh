@@ -163,7 +163,7 @@ encode_to_49mb () {
 echo "=== start watching '${INPUT_DIR}' for new .mp4 files ==="
 
 # close_write は「ファイルの書き込みが完了した」というイベント
-inotifywait -m -e close_write --format '%w%f' "${INPUT_DIR}" | while read NEWFILE
+inotifywait -m -e close_write --format '%w%f' "${INPUT_DIR}" | while IFS= read -r NEWFILE
 do
   # .mp4 以外はスキップ
   if [[ "${NEWFILE}" =~ \.mp4$ ]]; then
