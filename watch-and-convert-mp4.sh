@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # input/ に新たに .mp4 ファイルが置かれたら、
-# 49MB を目指して FullHD 60fps にエンコードしたファイルを output/ に書き出し、
+# 10MB未満を目標に FullHD 60fps にエンコードしたファイルを output/ に書き出し、
 # 処理が終わったら元ファイル (input/*.mp4) を削除します。
 #
 # 依存:
@@ -15,10 +15,13 @@
 #
 
 # ------ ここからユーザ設定 ------
-TARGET_SIZE_MB=49
-MAX_LOOP=6                 # ビットレート再調整の最大試行回数
+TARGET_MAX_SIZE_MB=10      # 上限サイズ (この値未満を目標)
+SIZE_MARGIN_KB=128         # 「未満」を確実にするための安全マージン
+MAX_LOOP_UPPER=12          # ビットレート再調整の最大試行回数(上限)
 PRESET="medium"            # x264のプリセット
 AUDIO_BITRATE=128          # kbps
+MIN_AUDIO_BITRATE=24       # kbps (ターゲットが小さい場合に自動調整)
+MIN_VIDEO_BITRATE=30       # kbps (極端な圧縮時の下限)
 SCALE="1920:1080"          # FullHD
 FRAMERATE="60"
 # ------ ここまでユーザ設定 ------
@@ -37,15 +40,21 @@ if [ ! -d "${OUTPUT_DIR}" ]; then
 fi
 
 # ---- 2passエンコード + ファイルサイズ再調整を行う関数 ----
-encode_to_49mb () {
+encode_to_target_size () {
   local in_filepath="$1"
   local out_filepath="$2"
 
   # 拡張子抜きのベースファイル名を取得 (passlog名に使う)
   local basename_noext
   basename_noext="$(basename "${in_filepath}" .mp4)"
-  
-  local target_size_bytes=$(( TARGET_SIZE_MB * 1024 * 1024 ))
+
+  local target_max_bytes=$(( TARGET_MAX_SIZE_MB * 1024 * 1024 ))
+  local target_size_bytes=$(( target_max_bytes - SIZE_MARGIN_KB * 1024 ))
+  if [ "${target_size_bytes}" -le 0 ]; then
+    echo "  --> エラー: TARGET_MAX_SIZE_MB / SIZE_MARGIN_KB の設定値が不正です。"
+    return 1
+  fi
+
   local duration
   duration="$(ffprobe -v error -select_streams v:0 -show_entries format=duration \
              -of csv=p=0 "${in_filepath}")"
@@ -55,29 +64,70 @@ encode_to_49mb () {
     return 1
   fi
 
-  # 初期映像ビットレート(kbps)を計算
+  # 目標サイズから平均総ビットレート(kbps)を算出し、音声を含めて動的に配分
+  local target_total_kbps
+  target_total_kbps=$(awk -v size_bits=$((target_size_bytes * 8)) -v dur="${duration}" \
+    'BEGIN { printf "%.0f", (size_bits / dur) / 1000 }')
+
+  local dynamic_audio_bitrate="${AUDIO_BITRATE}"
+  if [ "${target_total_kbps}" -le $((AUDIO_BITRATE + MIN_VIDEO_BITRATE)) ]; then
+    dynamic_audio_bitrate=$(
+      awk -v total="${target_total_kbps}" -v min_aud="${MIN_AUDIO_BITRATE}" \
+        'BEGIN {
+           cand = int(total * 0.20);
+           if (cand < min_aud) cand = min_aud;
+           printf "%d", cand;
+         }'
+    )
+  fi
+
   local video_bitrate_initial
   video_bitrate_initial=$(
-    awk -v size_bits=$((target_size_bytes * 8)) \
-        -v dur="${duration}" \
-        -v aud_kbps="${AUDIO_BITRATE}" \
+    awk -v total="${target_total_kbps}" \
+        -v aud="${dynamic_audio_bitrate}" \
+        -v min_v="${MIN_VIDEO_BITRATE}" \
       'BEGIN {
-         vbps = (size_bits / dur) / 1000;  # 全体の平均ビットレート (kbps)
-         vbps = (vbps - aud_kbps) * 0.95;  # 音声分を差し引いて安全率5%程度
-         if (vbps < 100) vbps = 100;       # 下限 100 kbps
+         vbps = (total - aud) * 0.97;  # 余裕を持たせる
+         if (vbps < min_v) vbps = min_v;
          printf "%.0f", vbps;
        }'
   )
 
-  local min_video_bitrate=100
-  local max_video_bitrate=$((video_bitrate_initial * 5))
+  local min_video_bitrate
+  min_video_bitrate=$(awk -v init="${video_bitrate_initial}" -v min_v="${MIN_VIDEO_BITRATE}" \
+    'BEGIN {
+      cand = int(init * 0.20);
+      if (cand < min_v) cand = min_v;
+      printf "%d", cand;
+    }')
+
+  local max_video_bitrate=$((video_bitrate_initial * 4))
+  if [ "${max_video_bitrate}" -lt $((video_bitrate_initial + 200)) ]; then
+    max_video_bitrate=$((video_bitrate_initial + 200))
+  fi
+
+  local max_loop
+  max_loop=$(awk -v min="${min_video_bitrate}" -v max="${max_video_bitrate}" -v upper="${MAX_LOOP_UPPER}" \
+    'BEGIN {
+      range = max - min + 1;
+      loops = int(log(range) / log(2)) + 3;
+      if (loops < 6) loops = 6;
+      if (loops > upper) loops = upper;
+      printf "%d", loops;
+    }')
+
   local current_loop=1
-  local best_diff=999999999
   local best_bitrate="${video_bitrate_initial}"
+  local best_under_size=-1
+  local best_over_size=999999999999
+  local best_over_bitrate="${video_bitrate_initial}"
 
   echo "  --> 動画長さ: ${duration}s"
+  echo "  --> 上限サイズ: ${TARGET_MAX_SIZE_MB} MB (探索目標: $((target_size_bytes/1024/1024)) MB台)"
+  echo "  --> 目標総ビットレート: ${target_total_kbps} kbps"
+  echo "  --> 音声ビットレート: ${dynamic_audio_bitrate} kbps"
   echo "  --> 初期ビットレート推定: ${video_bitrate_initial} kbps"
-  
+
   # 2passエンコード用の内部関数 (1回の試行)
   do_2pass () {
     local bitrate_kbps="$1"
@@ -95,14 +145,14 @@ encode_to_49mb () {
       -c:v libx264 -preset "${PRESET}" -b:v "${bitrate_kbps}k" \
       -pass 2 -passlogfile "${passlog}" \
       -pix_fmt yuv420p -r "${FRAMERATE}" -s "${SCALE}" \
-      -c:a aac -b:a "${AUDIO_BITRATE}k" \
+      -c:a aac -b:a "${dynamic_audio_bitrate}k" \
       "${out_filepath}" 2>/dev/null
 
     rm -f "${passlog}"*
   }
 
   # ビットレート調整の二分探索ループ
-  while [ "${current_loop}" -le "${MAX_LOOP}" ]
+  while [ "${current_loop}" -le "${max_loop}" ]
   do
     local cur_video_bitrate
     cur_video_bitrate=$(
@@ -110,7 +160,7 @@ encode_to_49mb () {
           -v max="${max_video_bitrate}" \
         'BEGIN { printf "%.0f", (min + max) / 2 }'
     )
-    echo "  -> [${current_loop}/${MAX_LOOP}] 試行ビットレート: ${cur_video_bitrate} kbps"
+    echo "  -> [${current_loop}/${max_loop}] 試行ビットレート: ${cur_video_bitrate} kbps"
 
     do_2pass "${cur_video_bitrate}"
 
@@ -126,21 +176,25 @@ encode_to_49mb () {
       return 1
     fi
 
-    local diff=$(( filesize - target_size_bytes ))
-    echo "    出力ファイルサイズ: $((filesize/1024/1024)) MB (差分: ${diff} bytes)"
+    local diff=$(( filesize - target_max_bytes ))
+    echo "    出力ファイルサイズ: $((filesize/1024/1024)) MB (10MB上限との差分: ${diff} bytes)"
 
-    if [ "${diff}" -gt 0 ]; then
-      # ターゲットサイズ超過 → ビットレートを下げる
-      max_video_bitrate=$((cur_video_bitrate - 1))
-    else
-      # ターゲットサイズ未満 → ビットレートを上げる
-      min_video_bitrate=$((cur_video_bitrate + 1))
+    if [ "${filesize}" -lt "${target_max_bytes}" ] && [ "${filesize}" -gt "${best_under_size}" ]; then
+      best_under_size="${filesize}"
+      best_bitrate="${cur_video_bitrate}"
     fi
 
-    local abs_diff="${diff#-}"  # 絶対値
-    if [ "${abs_diff}" -lt "${best_diff}" ]; then
-      best_diff="${abs_diff}"
-      best_bitrate="${cur_video_bitrate}"
+    if [ "${filesize}" -ge "${target_max_bytes}" ] && [ "${filesize}" -lt "${best_over_size}" ]; then
+      best_over_size="${filesize}"
+      best_over_bitrate="${cur_video_bitrate}"
+    fi
+
+    if [ "${diff}" -ge 0 ]; then
+      # 10MB以上 → ビットレートを下げる
+      max_video_bitrate=$((cur_video_bitrate - 1))
+    else
+      # 10MB未満 → 品質を上げるためビットレートを上げる
+      min_video_bitrate=$((cur_video_bitrate + 1))
     fi
 
     # 二分探索が収束したら終了
@@ -152,9 +206,16 @@ encode_to_49mb () {
     current_loop=$((current_loop + 1))
   done
 
+  if [ "${best_under_size}" -lt 0 ]; then
+    # すべて10MB以上だった場合は、超過が最小の候補を採用
+    best_bitrate="${best_over_bitrate}"
+  fi
+
+  do_2pass "${best_bitrate}"
+
   echo "  --> 最終推奨ビットレート: ${best_bitrate} kbps"
   echo "  --> エンコード完了: ${out_filepath}"
-  
+
   # 正常終了
   return 0
 }
@@ -177,7 +238,7 @@ do
     fi
 
     # エンコードを実行
-    encode_to_49mb "${NEWFILE}" "${OUT_PATH}"
+    encode_to_target_size "${NEWFILE}" "${OUT_PATH}"
     if [ $? -eq 0 ]; then
       # 正常終了なら元ファイルを削除
       echo "  --> 元ファイルを削除します: ${NEWFILE}"
